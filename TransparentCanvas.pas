@@ -673,7 +673,8 @@ begin
   if Length(Text) = 0 then Exit; // Crash creating zero-sized bitmap
   if not CanDrawGlowText then raise ETransparentCanvasException.Create('Cannot use DrawThemeTextEx');
 
-  TextSize := Size(ARect);
+  TextSize.cx := ARect.Right - ARect.Left;
+  TextSize.cy := ARect.Bottom - ARect.Top;
   AlignFlags := AlignmentToFlags(Alignment);
   WText := UnicodeString(Text);
   TempImage := TAlphaBitmapWrapper.CreateForDrawThemeTextEx(FWorkingCanvas.FDCHandle, TextSize.cx + GlowSize*2, TextSize.cy + GlowSize*2);
@@ -695,7 +696,11 @@ begin
       TextRect := Rect(GlowSize, GlowSize, TextSize.cx + GlowSize*2, TextSize.cy + GlowSize*2);
       DrawThemeTextEx(Theme, TempImage.FDCHandle, TransparentCanvasEditPart, TransparentCanvasEditState,
         PWideChar(WText), Length(WText), AlignFlags or DT_TOP or DT_NOCLIP, @TextRect,
+{$ifdef FPC}
         @Options);
+{$else}
+        Options);
+{$endif}
 
       if ProcessBackColor then begin
         TempImage.TintByAlphaToColor(BackColor);
@@ -706,7 +711,11 @@ begin
         Options.iGlowSize := 0;
         DrawThemeTextEx(Theme, TempImage.FDCHandle, TransparentCanvasEditPart, TransparentCanvasEditState,
           PWideChar(WText), Length(WText), AlignFlags or DT_TOP or DT_NOCLIP, @TextRect,
+{$ifdef FPC}
           @Options);
+{$else}
+          Options);
+{$endif}
       end;
     finally
       CloseThemeData(Theme);
@@ -977,7 +986,8 @@ begin
   if not CanUseDrawThemeTextEx then raise ETransparentCanvasException.Create('Cannot use DrawThemeTextEx');
 
   AlignFlags := AlignmentToFlags(Alignment);
-  TextSize := Size(ARect); //TextExtent(Text);
+  TextSize.cx := ARect.Right - ARect.Left; //TextExtent(Text);
+  TextSize.cy := ARect.Bottom - ARect.Top;
   // Clip by clipping the size of the rectangle it assumes the text fits in
   TextSize.cx := min(TextSize.cx, ARect.Right-ARect.Left);
   TextSize.cy := min(TextSize.cy, ARect.Bottom-ARect.Top);
@@ -1001,7 +1011,11 @@ begin
       TextRect := Rect(0, 0, TextSize.cx, TextSize.cy);
       DrawThemeTextEx(Theme, TempImage.FDCHandle, TransparentCanvasEditPart, TransparentCanvasEditState,
         PWideChar(WText), Length(WText), AlignFlags or DT_TOP, @TextRect,
+{$ifdef FPC}
         @Options);
+{$else}
+        Options);
+{$endif}
     finally
       CloseThemeData(Theme);
     end;

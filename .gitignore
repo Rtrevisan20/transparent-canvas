@@ -1,7 +1,15 @@
 lib/
+__history/
 *.identcache
 *.compiled
 *.ppu
 *.o
 *.dsk
 *.res
+*.dcu
+*.exe
+*.dproj.local
+Win32/
+Win64/
+demo/Win32/
+demo/Win64/
