@@ -1,0 +1,7 @@
+lib/
+*.identcache
+*.compiled
+*.ppu
+*.o
+*.dsk
+*.res

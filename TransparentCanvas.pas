@@ -25,10 +25,15 @@ interface
 
 uses
   Windows, SysUtils, Classes, Controls, Graphics, Types
+{$ifdef FPC}
+  // FPC has no UITypes unit; TFont.GetStyle lives in the LCL Graphics unit
+  ;
+{$else}
   {$if CompilerVersion >= 23.0} // XE2
     , UITypes // Let inline function TFont.GetStyle be expanded
   {$ifend}
   ;
+{$endif}
 
 type
   ETransparentCanvasException = class(Exception)
@@ -166,10 +171,18 @@ type
 
     procedure SaveToFile(const Filename : string);
 
+    {$ifdef FPC}
+    // LCL TBitmap does not sync raw GDI draws on its Canvas.Handle back to its
+    // pixel store, so SaveToFile writes the DIB directly on Lazarus.
+    procedure SaveToFileDirect(const Filename: string);
+    {$endif}
+
     procedure Draw(const X, Y: Integer; Canvas: TCanvas; const Width, Height : Integer;
       const UseTransparentColor : Boolean = false; const TransparentColor : COLORREF = $0; const TransparentEdgeWidth :
       Integer = -1); overload;
+    {$ifndef FPC} // TMetafile is not part of LCL
     procedure Draw(const X, Y: Integer; const Metafile: TMetafile; const Width, Height : Integer; const Transparency : Byte = $FF); overload;
+    {$endif}
     procedure Draw(const X, Y : Integer; Other : TCustomTransparentCanvas; const Transparency : Byte = 255); overload;
 
     procedure DrawTo(const X, Y : Integer; Canvas : TCanvas; const TargetWidth, TargetHeight: Integer; const Transparency : Byte = $FF); overload;
@@ -227,23 +240,59 @@ type
 implementation
 
 uses
-  Math, Themes, UxTheme, RTLConsts;
-
-{$if CompilerVersion >= 23.0} // XE2
-  function InternalStyleServices : TCustomStyleServices;
-  begin
-    {$if declared(StyleServices)}
-      Result := StyleServices;
-    {$else}
-      Result := ThemeServices; // Deprecated in favour of StyleServices
-    {$ifend}
-  end;
+  Math
+{$ifdef FPC}
+  // FPC/LCL lacks RTLConsts.SAssignError and the VCL 'Themes' unit with
+  // TThemeServices. UxTheme provides OpenThemeData/CloseThemeData and loads
+  // DrawThemeTextEx dynamically from uxtheme.dll.
+  , UxTheme
 {$else}
-  function InternalStyleServices : TThemeServices;
-  begin
-    Result := ThemeServices;
-  end;
-{$ifend}
+  , Themes, UxTheme, RTLConsts
+{$endif}
+  ;
+
+{$ifdef FPC}
+// AlphaBlend comes from msimg32.dll, which is linked by Delphi's Windows unit
+// but not by FPC's, so declare it explicitly.
+function AlphaBlend(hdcDest: HDC; nXOriginDest, nYOriginDest, nWidthDest, nHeightDest: Integer;
+  hdcSrc: HDC; nXOriginSrc, nYOriginSrc, nWidthSrc, nHeightSrc: Integer;
+  blendFunction: TBlendFunction): BOOL; stdcall; external 'msimg32.dll' name 'AlphaBlend';
+{$endif}
+
+const
+  // Edit control part/state used with DrawThemeTextEx. These match the values
+  // returned by GetElementDetails(teEditTextNormal) on VCL, and are defined
+  // separately so the code compiles for both Delphi and Lazarus/FPC.
+  TransparentCanvasEditPart     = 1; // EP_EDITTEXT
+  TransparentCanvasEditState    = 1; // ETS_NORMAL
+
+function OpenEditTheme : HTHEME;
+begin
+  Result := OpenThemeData(0, PWideChar(UnicodeString('EDIT')));
+end;
+
+function GDIHandle(const ABrush: TBrush): HBRUSH; overload;
+begin
+  {$ifdef FPC}
+  Result := ABrush.Reference.Handle;
+  {$else}
+  Result := ABrush.Handle;
+  {$endif}
+end;
+
+function GDIHandle(const APen: TPen): HPEN; overload;
+begin
+  {$ifdef FPC}
+  Result := APen.Reference.Handle;
+  {$else}
+  Result := APen.Handle;
+  {$endif}
+end;
+
+function GDIHandle(const AFont: TFont): HFONT; overload;
+begin
+  Result := AFont.Handle;
+end;
 
 function AlignmentToFlags(const Alignment : TAlignment) : DWORD;
 begin
@@ -264,13 +313,19 @@ end;
 
 function TCustomTransparentCanvas.CanUseDrawThemeTextEx: boolean;
 begin
+  {$ifdef FPC}
+  // FPC's UxTheme unit loads DrawThemeTextEx dynamically from uxtheme.dll; on
+  // systems without the API (pre-Vista) the pointer remains nil.
+  Result := Assigned(DrawThemeTextEx);
+  {$else}
   Result :=
     {$if declared(StyleServices)} // Can't test TCustomStyleServices.Enabled, assume deprecation follows StyleServices
-      InternalStyleServices.Enabled
+      StyleServices.Enabled
     {$else}
-      InternalStyleServices.ThemesEnabled
+      ThemeServices.ThemesEnabled
     {$ifend}
     and (Win32MajorVersion >= 6);
+  {$endif}
 end;
 
 procedure TCustomTransparentCanvas.Clear;
@@ -347,9 +402,17 @@ begin
     FAttachedDC := 0;
   end else begin
     if Assigned(Source) then
+      {$ifdef FPC}
+      raise EConvertError.CreateFmt('Cannot assign a %s to a %s', [Source.ClassName, ClassName])
+      {$else}
       raise EConvertError.CreateResFmt(@RTLConsts.SAssignError, [Source.ClassName, ClassName])
+      {$endif}
     else
-      raise EConvertError.CreateResFmt(@RTLConsts.SAssignError, ['nil', ClassName]);
+      {$ifdef FPC}
+      raise EConvertError.CreateFmt('Cannot assign a %s to a %s', ['nil', ClassName])
+      {$else}
+      raise EConvertError.CreateResFmt(@RTLConsts.SAssignError, ['nil', ClassName])
+      {$endif};
   end;
 end;
 
@@ -359,9 +422,19 @@ begin
 end;
 
 procedure TCustomTransparentCanvas.SaveToFile(const Filename : string);
+{$ifndef FPC}
 var
   BMP : TBitmap;
+{$endif}
 begin
+{$ifdef FPC}
+  // LCL's TBitmap keeps an authoritative pixel store (RawImage) that is not
+  // updated by raw GDI calls made through its Canvas.Handle, so compositing
+  // onto Bitmap.Canvas and then saving would produce an empty image. Write the
+  // 32-bit BMP straight from our own DIB instead (pixels are premultiplied
+  // BGRA in bottom-up order, exactly what the format expects).
+  SaveToFileDirect(Filename);
+{$else}
   // Draw to a transparent 32-bit bitmap, and save that
   BMP := TBitmap.Create;
   try
@@ -373,7 +446,68 @@ begin
   finally
     BMP.Free;
   end;
+{$endif}
 end;
+
+{$ifdef FPC}
+procedure TCustomTransparentCanvas.SaveToFileDirect(const Filename: string);
+type
+  TDirectBMPFileHeader = packed record
+    ID: Word;
+    FileSize: Cardinal;
+    Reserved: array[0..1] of Word;
+    DataOffset: Cardinal;
+  end;
+  TDirectBMPInfoHeader = packed record
+    HeaderSize: Cardinal;
+    Width, Height: Longint;
+    Planes: Word;
+    BitCount: Word;
+    Compression: Cardinal;
+    SizeImage: Cardinal;
+    XPelsPerMeter, YPelsPerMeter: Cardinal;
+    ClrUsed, ClrImportant: Cardinal;
+  end;
+var
+  BMP : TAlphaBitmapWrapper;
+  Stream : TFileStream;
+  FileHeader : TDirectBMPFileHeader;
+  InfoHeader : TDirectBMPInfoHeader;
+begin
+  Stream := TFileStream.Create(Filename, fmCreate or fmShareDenyWrite);
+  try
+    // Composite the working canvas over an opaque background, mirroring the
+    // Delphi path (blank bitmap + DrawTo) so untouched pixels end up opaque.
+    BMP := TAlphaBitmapWrapper.CreateBlank(0, Width, Height);
+    try
+      BMP.SetAllTransparency($FF);
+      FWorkingCanvas.BlendTo(0, 0, BMP, $FF);
+
+      FillChar(FileHeader, SizeOf(FileHeader), 0);
+      FileHeader.ID := $4D42; // 'BM'
+      FileHeader.FileSize := SizeOf(FileHeader) + SizeOf(InfoHeader) + Cardinal(Width) * Cardinal(Height) * 4;
+      FileHeader.DataOffset := SizeOf(FileHeader) + SizeOf(InfoHeader);
+      Stream.WriteBuffer(FileHeader, SizeOf(FileHeader));
+
+      FillChar(InfoHeader, SizeOf(InfoHeader), 0);
+      InfoHeader.HeaderSize := SizeOf(InfoHeader);
+      InfoHeader.Width := Width;
+      InfoHeader.Height := Height;
+      InfoHeader.Planes := 1;
+      InfoHeader.BitCount := 32;
+      InfoHeader.Compression := BI_RGB;
+      InfoHeader.SizeImage := Cardinal(Width) * Cardinal(Height) * 4;
+      Stream.WriteBuffer(InfoHeader, SizeOf(InfoHeader));
+
+      Stream.WriteBuffer(BMP.QuadPointer^, Width * Height * 4);
+    finally
+      BMP.Free;
+    end;
+  finally
+    Stream.Free;
+  end;
+end;
+{$endif}
 
 procedure TCustomTransparentCanvas.Draw(const X, Y: Integer; Canvas: TCanvas; const Width, Height : Integer;
   const UseTransparentColor : Boolean; const TransparentColor : COLORREF; const TransparentEdgeWidth : Integer);
@@ -392,6 +526,7 @@ begin
   end;
 end;
 
+{$ifndef FPC} // TMetafile is not part of LCL
 procedure TCustomTransparentCanvas.Draw(const X, Y: Integer; const Metafile: TMetafile;
   const Width, Height: Integer; const Transparency : Byte = $FF);
 var
@@ -411,6 +546,7 @@ begin
     TempImage.Free;
   end;
 end;
+{$endif}
 
 procedure TCustomTransparentCanvas.Draw(const X, Y : Integer; Other : TCustomTransparentCanvas;
   const Transparency : Byte = 255);
@@ -460,7 +596,7 @@ var
 begin
   TempImage := TAlphaBitmapWrapper.CreateForGDI(FWorkingCanvas.FDCHandle, X2-X1, Y2-Y1);
   try
-    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(Brush.Handle, Pen.Handle, Font.Handle));
+    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(GDIHandle(Brush), GDIHandle(Pen), GDIHandle(Font)));
     SetWindowOrgEx(TempImage.FDCHandle, X1 - Pen.Width div 2, Y1 - Pen.Width div 2, nil);
     Windows.Ellipse(TempImage.FDCHandle, X1, Y1, X2, Y2);
     SetWindowOrgEx(TempImage.FDCHandle, 0, 0, nil);
@@ -529,43 +665,51 @@ var
   TempImage : TAlphaBitmapWrapper;
   TextSize : TSize;
   Options : TDTTOpts;
-  Details: TThemedElementDetails;
+  Theme : HTHEME;
   TextRect : TRect;
   AlignFlags : DWORD;
+  WText : UnicodeString;
 begin
   if Length(Text) = 0 then Exit; // Crash creating zero-sized bitmap
   if not CanDrawGlowText then raise ETransparentCanvasException.Create('Cannot use DrawThemeTextEx');
 
-  TextSize := ARect.Size;
+  TextSize := Size(ARect);
   AlignFlags := AlignmentToFlags(Alignment);
+  WText := UnicodeString(Text);
   TempImage := TAlphaBitmapWrapper.CreateForDrawThemeTextEx(FWorkingCanvas.FDCHandle, TextSize.cx + GlowSize*2, TextSize.cy + GlowSize*2);
   try
-    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(0, 0, Font.Handle));
+    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(0, 0, GDIHandle(Font)));
     SetBkMode(TempImage.FDCHandle, TRANSPARENT);
     SetTextColor(TempImage.FDCHandle, ColorToRGB(Font.Color));
 
-		ZeroMemory(@Options, SizeOf(Options));
-		Options.dwSize := SizeOf(Options);
-		Options.dwFlags := DTT_TEXTCOLOR or DTT_COMPOSITED or DTT_GLOWSIZE;
-		Options.crText := ColorToRGB(Font.Color);
-		Options.iGlowSize := GlowSize;
-
-		Details := InternalStyleServices.GetElementDetails(teEditTextNormal);
-    TextRect := Rect(GlowSize, GlowSize, TextSize.cx + GlowSize*2, TextSize.cy + GlowSize*2);
-    DrawThemeTextEx(InternalStyleServices.Theme[teEdit], TempImage.FDCHandle, Details.Part, Details.State,
-      PChar(Text), Length(Text), AlignFlags or DT_TOP or DT_NOCLIP, TextRect,
-      Options);
-
-    if ProcessBackColor then begin
-      TempImage.TintByAlphaToColor(BackColor);
-      // Now draw the text over again, but with no glow, so only the text is drawn
-      TextRect := Rect(GlowSize, GlowSize, TextSize.cx + GlowSize, TextSize.cy + GlowSize);
-      Options.dwFlags := DTT_TEXTCOLOR or DTT_COMPOSITED;
+    Theme := OpenEditTheme;
+    if Theme = 0 then
+      raise ETransparentCanvasException.Create('Cannot open theme data for edit control');
+    try
+      FillChar(Options, SizeOf(Options), 0);
+      Options.dwSize := SizeOf(Options);
+      Options.dwFlags := DTT_TEXTCOLOR or DTT_COMPOSITED or DTT_GLOWSIZE;
       Options.crText := ColorToRGB(Font.Color);
-      Options.iGlowSize := 0;
-      DrawThemeTextEx(InternalStyleServices.Theme[teEdit], TempImage.FDCHandle, Details.Part, Details.State,
-        PChar(Text), Length(Text), AlignFlags or DT_TOP or DT_NOCLIP, TextRect,
-        Options);
+      Options.iGlowSize := GlowSize;
+
+      TextRect := Rect(GlowSize, GlowSize, TextSize.cx + GlowSize*2, TextSize.cy + GlowSize*2);
+      DrawThemeTextEx(Theme, TempImage.FDCHandle, TransparentCanvasEditPart, TransparentCanvasEditState,
+        PWideChar(WText), Length(WText), AlignFlags or DT_TOP or DT_NOCLIP, @TextRect,
+        @Options);
+
+      if ProcessBackColor then begin
+        TempImage.TintByAlphaToColor(BackColor);
+        // Now draw the text over again, but with no glow, so only the text is drawn
+        TextRect := Rect(GlowSize, GlowSize, TextSize.cx + GlowSize, TextSize.cy + GlowSize);
+        Options.dwFlags := DTT_TEXTCOLOR or DTT_COMPOSITED;
+        Options.crText := ColorToRGB(Font.Color);
+        Options.iGlowSize := 0;
+        DrawThemeTextEx(Theme, TempImage.FDCHandle, TransparentCanvasEditPart, TransparentCanvasEditState,
+          PWideChar(WText), Length(WText), AlignFlags or DT_TOP or DT_NOCLIP, @TextRect,
+          @Options);
+      end;
+    finally
+      CloseThemeData(Theme);
     end;
 
     case Alignment of
@@ -636,7 +780,7 @@ var
 begin
   TempImage := TAlphaBitmapWrapper.CreateForGDI(FWorkingCanvas.FDCHandle, X2-X1, Y2-Y1);
   try
-    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(Brush.Handle, Pen.Handle, Font.Handle));
+    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(GDIHandle(Brush), GDIHandle(Pen), GDIHandle(Font)));
     SetWindowOrgEx(TempImage.FDCHandle, X1 - Pen.Width div 2, Y1 - Pen.Width div 2, nil);
     Windows.Rectangle(TempImage.FDCHandle, X1, Y1, X2, Y2);
     SetWindowOrgEx(TempImage.FDCHandle, 0, 0, nil);
@@ -664,7 +808,7 @@ var
 begin
   TempImage := TAlphaBitmapWrapper.CreateForGDI(FWorkingCanvas.FDCHandle, X2-X1 + Pen.Width, Y2-Y1 + Pen.Width);
   try
-    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(Brush.Handle, Pen.Handle, Font.Handle));
+    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(GDIHandle(Brush), GDIHandle(Pen), GDIHandle(Font)));
     SetWindowOrgEx(TempImage.FDCHandle, X1 - Pen.Width div 2, Y1 - Pen.Width div 2, nil);
     Windows.RoundRect(TempImage.FDCHandle, X1, Y1, X2, Y2, XRadius, YRadius);
     SetWindowOrgEx(TempImage.FDCHandle, 0, 0, nil);
@@ -741,7 +885,7 @@ begin
   end;
 
   if CanUseDrawThemeTextEx then begin // Can use DrawThemeTextEx; just get text extent normally
-    FWorkingCanvas.SelectObjects(TGDIObjects.CreateWithHandles(0, 0, Font.Handle));
+    FWorkingCanvas.SelectObjects(TGDIObjects.CreateWithHandles(0, 0, GDIHandle(Font)));
     GetTextExtentPoint32(FWorkingCanvas.FDCHandle, PChar(Text), Length(Text), Result);
     FWorkingCanvas.SelectOriginalObjects;
   end else begin
@@ -824,7 +968,8 @@ var
   TempImage : TAlphaBitmapWrapper;
   TextSize : TSize;
   Options : TDTTOpts;
-  Details: TThemedElementDetails;
+  Theme : HTHEME;
+  WText : UnicodeString;
   TextRect : TRect;
   AlignFlags : DWORD;
 begin
@@ -832,27 +977,34 @@ begin
   if not CanUseDrawThemeTextEx then raise ETransparentCanvasException.Create('Cannot use DrawThemeTextEx');
 
   AlignFlags := AlignmentToFlags(Alignment);
-  TextSize := ARect.Size; //TextExtent(Text);
+  TextSize := Size(ARect); //TextExtent(Text);
   // Clip by clipping the size of the rectangle it assumes the text fits in
   TextSize.cx := min(TextSize.cx, ARect.Right-ARect.Left);
   TextSize.cy := min(TextSize.cy, ARect.Bottom-ARect.Top);
+  WText := UnicodeString(Text);
   TempImage := TAlphaBitmapWrapper.CreateForDrawThemeTextEx(FWorkingCanvas.FDCHandle, TextSize.cx, TextSize.cy);
   try
-    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(0, 0, Font.Handle));
+    TempImage.SelectObjects(TGDIObjects.CreateWithHandles(0, 0, GDIHandle(Font)));
     SetBkMode(TempImage.FDCHandle, TRANSPARENT);
     SetTextColor(TempImage.FDCHandle, ColorToRGB(Font.Color));
 
-		ZeroMemory(@Options, SizeOf(Options));
-		Options.dwSize := SizeOf(Options);
-		Options.dwFlags := DTT_TEXTCOLOR or DTT_COMPOSITED;
-		Options.crText := ColorToRGB(Font.Color);
-		Options.iGlowSize := 0;
+    Theme := OpenEditTheme;
+    if Theme = 0 then
+      raise ETransparentCanvasException.Create('Cannot open theme data for edit control');
+    try
+      FillChar(Options, SizeOf(Options), 0);
+      Options.dwSize := SizeOf(Options);
+      Options.dwFlags := DTT_TEXTCOLOR or DTT_COMPOSITED;
+      Options.crText := ColorToRGB(Font.Color);
+      Options.iGlowSize := 0;
 
-		Details := InternalStyleServices.GetElementDetails(teEditTextNormal);
-    TextRect := Rect(0, 0, TextSize.cx, TextSize.cy);
-    DrawThemeTextEx(InternalStyleServices.Theme[teEdit], TempImage.FDCHandle, Details.Part, Details.State,
-      PChar(Text), Length(Text), AlignFlags or DT_TOP, TextRect,
-      Options);
+      TextRect := Rect(0, 0, TextSize.cx, TextSize.cy);
+      DrawThemeTextEx(Theme, TempImage.FDCHandle, TransparentCanvasEditPart, TransparentCanvasEditState,
+        PWideChar(WText), Length(WText), AlignFlags or DT_TOP, @TextRect,
+        @Options);
+    finally
+      CloseThemeData(Theme);
+    end;
 
     SetBkMode(TempImage.FDCHandle, OPAQUE);
     TempImage.BlendTo(ARect.Left, ARect.Top, FWorkingCanvas, Alpha);
@@ -930,7 +1082,7 @@ end;
 
 procedure TAlphaBitmapWrapper.Clear;
 begin
-  ZeroMemory(FQuads, FWidth * FHeight * SizeOf(TQuadColor));
+  FillChar(FQuads^, FWidth * FHeight * SizeOf(TQuadColor), 0);
 end;
 
 procedure TAlphaBitmapWrapper.Construct(DC: HDC; Empty: Boolean; Width, Height: Integer; Inverted : boolean);
@@ -943,7 +1095,7 @@ begin
   if (FWidth <= 0) or (FHeight <= 0) then
     raise ETransparentCanvasException.Create('Invalid size specified; Width and Height must both be greater than zero.');
   FDCHandle := CreateCompatibleDC(DC);
-  ZeroMemory(@BMPInfo, SizeOf(TBitmapInfo));
+  FillChar(BMPInfo, SizeOf(TBitmapInfo), 0);
   with BMPInfo.bmiHeader do begin
     biSize := SizeOf(TBitmapInfo);
     biWidth := FWidth;
@@ -965,9 +1117,9 @@ begin
   FOriginalBMP := SelectObject(FDCHandle, FBMPHandle);
   GdiFlush; // Need to flush before any manipulation of bits
   if Empty then begin
-    ZeroMemory(FQuads, Width * Height * SizeOf(TQuadColor));
+    FillChar(FQuads^, Width * Height * SizeOf(TQuadColor), 0);
   end else begin
-    FillMemory(FQuads, Width * Height * SizeOf(TQuadColor), $FF);
+    FillChar(FQuads^, Width * Height * SizeOf(TQuadColor), $FF);
   end;
 end;
 
